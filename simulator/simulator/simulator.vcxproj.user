@@ -1,0 +1,7 @@
+﻿<?xml version="1.0" encoding="utf-8"?>
+<Project ToolsVersion="4.0" xmlns="http://schemas.microsoft.com/developer/msbuild/2003">
+  <PropertyGroup Condition="'$(Configuration)|$(Platform)'=='Debug|Win32'">
+    <LocalDebuggerCommandArguments>C:/Users/dell/Desktop/cmd_file.txt C:/Users/dell/Desktop/config_file.txt C:/Users/dell/Desktop/mem_init.txt C:/Users/dell/Desktop/regs_dump.txt C:/Users/dell/Desktop/mem_dump.txt C:/Users/dell/Desktop/time.txt C:/Users/dell/Desktop/committed.txt</LocalDebuggerCommandArguments>
+    <DebuggerFlavor>WindowsLocalDebugger</DebuggerFlavor>
+  </PropertyGroup>
+</Project>
