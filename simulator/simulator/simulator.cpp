@@ -11,9 +11,14 @@
 #include <string.h> 
 #include <Windows.h>
 #include <assert.h>
+#include <math.h>
 
 #define MAX_MEM_SIZE 16777216 //16MB
 #define MAX_NUM_COMMANDS 100000
+
+#define L1_L2_BUS_WIDTH 4 //4 bytes = 32bits
+#define L2_MEM_BUS_WIDTH 4//4 bytes = 32bits
+#define WORD_SIZE 4
 
 typedef struct {
 	char cmd_name [10];
@@ -26,7 +31,7 @@ typedef struct {
 	int Rd  ; // valid only for R_type 
 	char immediate [256] ; //it could be either a number(addi ... ) or a label (beq ...)  valid only for I_type
 	char address_label [256] ; // valid only for J_type
-	 
+	unsigned inst_address;
 } COMMAND ;
 
 typedef struct{
@@ -55,6 +60,44 @@ typedef struct{
 	int l2_cache_size ;
 	int mem_access_delay ; 
 }CONFIG ;
+
+typedef struct {
+	unsigned tag;
+	byte valid;
+	byte* block;
+	unsigned first_block_address;
+	unsigned last_block_address;
+	unsigned critical_word_offset;
+	int block_trans_start_time;
+	int block_trans_end_time;
+}L1_BLOCK;
+
+typedef struct {
+	unsigned tag[2];
+	byte valid[2];
+	unsigned first_block_address[2];
+	unsigned last_block_address[2];
+	byte LRU;
+	byte dirty[2];
+	byte* block[2];
+	unsigned critical_word_offset[2];
+	int block_trans_start_time[2];
+	int block_trans_end_time[2];
+}L2_BLOCK;
+
+typedef struct{
+	L1_BLOCK* block_arr;
+	int hit_counter;
+	int miss_counter;
+	int access_counter;
+}L1_CACHE;
+
+typedef struct{
+	L2_BLOCK* block_arr;
+	int hit_counter;
+	int miss_counter;
+	int access_counter;
+}L2_CACHE;
 
 
 BOOL is_labled (char* cmd , char* label ) {
@@ -211,12 +254,12 @@ int update_J_type(char* cmd_string,COMMAND* cmd_struct){
 	return 1 ;
 }
 
-int parse_cmd_str_to_cmd_struct (char* cmd_string , COMMAND* cmd_struct ){
+int parse_cmd_str_to_cmd_struct (char* cmd_string , COMMAND* cmd_struct,unsigned address ){
 
 	get_cmd_name (cmd_string ,  cmd_struct->cmd_name ) ;
 	cmd_type (cmd_struct->cmd_name , cmd_struct->cmd_type );
 	cmd_struct->b_is_labled = is_labled(cmd_string,cmd_struct->label);
-
+	cmd_struct->inst_address = address;
 	if (strcmp(cmd_struct->cmd_type,"R")==0){
 		update_R_type(cmd_string,cmd_struct );
 	}
@@ -238,14 +281,15 @@ int parse_cmd_str_to_cmd_struct (char* cmd_string , COMMAND* cmd_struct ){
 void parse_cmd_file(FILE* cmd_file, COMMAND* commands_arr){
 	char cmd_line[256];
 	int i = 0;
+	unsigned address = 0x00F00000;
 	while(fgets(cmd_line, sizeof(cmd_line), cmd_file)!=NULL) 
 	{
 		if (strlen(cmd_line)<=1){
 			continue;
 		}
-		parse_cmd_str_to_cmd_struct (cmd_line,&commands_arr[i]);
+		parse_cmd_str_to_cmd_struct (cmd_line,&commands_arr[i],address);
 		i++;
-		
+		address+=0x4;
 	}
 }
 
@@ -265,11 +309,240 @@ void load_memory(FILE* mem_init_file ,byte* mem_array){
 	}
 
 }
+void parse_address (unsigned* offset, unsigned* index, unsigned* tag, unsigned address, int block_size, int cache_size){
+	int offset_length = (int)(log((double)block_size)/log(2.0));
+	int index_length = (int)(log((double)(cache_size/block_size))/log(2.0));
+	int tag_length = 32-offset_length-index_length;
+	unsigned mask = 0;
+	
+	//extract offset
+	for (int i = 0 ; i < offset_length-1; i++){
+		mask++;
+		mask = mask<<1;
+	}
+	mask++;
+	*offset = address & mask;
+	mask = 0;
+	//extract index
+	for (int i = 0 ; i < index_length-1; i++){
+		mask++;
+		mask = mask<<1;
+	}
+	mask++;
+	mask = mask<<offset_length;
+	*index = (address & mask)>>offset_length;
+	mask = 0;
+	//extract tag
+	for (int i = 0 ; i < tag_length-1; i++){
+		mask++;
+		mask = mask<<1;
+	}
+	mask++;
+	mask = mask<<(index_length+offset_length);
+	*tag = (address & mask)>>(index_length+offset_length);
+
+}
+
+bool is_in_L1(unsigned index, unsigned tag, unsigned offset, L1_CACHE* L1_cache, int* current_time, CONFIG* config){
+
+	L1_cache->access_counter++;
+	int critical_word_index = L1_cache-> block_arr[index].critical_word_offset/4;
+	int requested_word_index = offset/4;
+	int nWordsRead; 
+	int block_size_words = config->l1_block_size/4;
+
+	if((L1_cache->block_arr[index].tag == tag) && (L1_cache->block_arr[index].valid)){
+		if(*current_time >= L1_cache->block_arr[index].block_trans_end_time){//requested block is cached and available
+			*current_time += config->l1_access_delay;
+			L1_cache->hit_counter++;
+			return true;
+		}else{//requested block is in tranfer progress
+			nWordsRead = (*current_time-L1_cache->block_arr[index].block_trans_start_time)*L1_L2_BUS_WIDTH/4;
+			if (requested_word_index > critical_word_index){
+				if (requested_word_index < critical_word_index + nWordsRead){		
+					*current_time += config->l1_access_delay;
+					L1_cache->hit_counter++;
+					return true;
+				}else{
+					*current_time += config->l1_access_delay + ((requested_word_index+1) - (critical_word_index+nWordsRead))/(L1_L2_BUS_WIDTH/4);
+					L1_cache->miss_counter++;
+					return true;
+				}
+			}else{
+				if (critical_word_index+nWordsRead<=block_size_words){
+					*current_time += config->l1_access_delay + ((block_size_words- (critical_word_index+nWordsRead))+requested_word_index+1)/(L1_L2_BUS_WIDTH/4);
+					L1_cache->miss_counter++;
+					return true;
+				}else{
+					*current_time += config->l1_access_delay + ((requested_word_index+1)- (critical_word_index+nWordsRead)%block_size_words)/(L1_L2_BUS_WIDTH/4);
+					L1_cache->miss_counter++;
+					return true;
+				}
+			}
+		}
+	}
+	*current_time += config->l1_access_delay;
+	L1_cache->miss_counter++;
+	return false;
+}
+
+
+bool is_in_L2(unsigned index, unsigned tag, unsigned offset, L2_CACHE* L2_cache, int* current_time, CONFIG* config){
+
+	L2_cache->access_counter++;
+	int critical_word_index;	
+	int requested_word_index = offset/4;
+	int nWordsRead; 
+	int block_size_words = config->l2_block_size/4;
+	int way;
+
+	if((L2_cache->block_arr[index].tag[0] == tag) && (L2_cache->block_arr[index].valid[0])){
+		way = 0;
+	}else if ((L2_cache->block_arr[index].tag[1] == tag) && (L2_cache->block_arr[index].valid[1])){
+		way = 1;
+	}else{
+		*current_time += config->l2_access_delay; 
+		L2_cache->miss_counter++;
+		return false;
+	}
+
+	L2_cache->block_arr[index].LRU = !way;
+	critical_word_index = L2_cache->block_arr[index].critical_word_offset[way]/4;
+
+	if(*current_time >= L2_cache->block_arr[index].block_trans_end_time[way]){//requested block is cached and available
+		*current_time += config->l2_access_delay;
+		L2_cache->hit_counter++;
+		return true;
+	}else{//requested block is in tranfer progress
+		nWordsRead = (*current_time-L2_cache->block_arr[index].block_trans_start_time[way])*L2_MEM_BUS_WIDTH/4;
+		if (requested_word_index > critical_word_index){
+			if (requested_word_index < critical_word_index + nWordsRead){		
+				*current_time += config->l2_access_delay;
+				L2_cache->hit_counter++;
+				return true;
+			}else{
+				*current_time += config->l2_access_delay + ((requested_word_index+1) - (critical_word_index+nWordsRead))/(L2_MEM_BUS_WIDTH/4);
+				L2_cache->miss_counter++;
+				return true;
+			}
+		}else{
+			if (critical_word_index+nWordsRead<=block_size_words){
+				*current_time += config->l2_access_delay + ((block_size_words- (critical_word_index+nWordsRead))+requested_word_index+1)/(L2_MEM_BUS_WIDTH/4);
+				L2_cache->miss_counter++;
+				return true;
+			}else{
+				*current_time += config->l2_access_delay + ((requested_word_index+1)- (critical_word_index+nWordsRead)%block_size_words)/(L2_MEM_BUS_WIDTH/4);
+				L2_cache->miss_counter++;
+				return true;
+			}
+		}
+	}
+}
+
+
+void L2_to_L1_trans(L1_CACHE* L1_cache, unsigned offset_L1, unsigned index_L1, unsigned tag_L1,L2_CACHE* L2_cache, unsigned offset_L2, unsigned index_L2, unsigned tag_L2,
+					int current_time, CONFIG* config, int way){
+	int i_L1;
+	int i_L2;
+
+	L1_cache->block_arr[index_L1].tag = tag_L1;
+	L1_cache->block_arr[index_L1].critical_word_offset = offset_L1;
+	L1_cache->block_arr[index_L1].block_trans_start_time = current_time;
+	L1_cache->block_arr[index_L1].block_trans_end_time = current_time + config->l1_block_size/L1_L2_BUS_WIDTH;
+	L1_cache->block_arr[index_L1].valid = 1;
+
+
+	for (int i = 0 ; i < config->l1_block_size; i++){
+		i_L1 = (offset_L1+i)%config->l1_block_size;
+		i_L2 = (offset_L2+i)%config->l2_block_size;
+		L1_cache->block_arr[index_L1].block[i_L1]=L2_cache->block_arr[index_L2].block[way][i_L2];
+	}
+		
+}
+
+void MEM_to_L2_trans(byte* mem, L2_CACHE* L2_cache, unsigned offset_L2, unsigned index_L2, unsigned tag_L2, 
+	int current_time, CONFIG* config, unsigned address,int way,bool is_inst){
+	
+	int i_L2;
+
+	L2_cache->block_arr[index_L2].tag[way] = tag_L2;
+	L2_cache->block_arr[index_L2].critical_word_offset[way] = offset_L2;
+	L2_cache->block_arr[index_L2].block_trans_start_time[way] = current_time;
+	L2_cache->block_arr[index_L2].block_trans_end_time[way] = current_time + config->l2_block_size/L1_L2_BUS_WIDTH;
+	L2_cache->block_arr[index_L2].valid[way] = 1;
+	L2_cache->block_arr[index_L2].LRU = !way;
+
+	if (!is_inst){
+		for (int i = 0 ; i < config->l2_block_size; i++){
+			i_L2 = (offset_L2+i)%config->l2_block_size;
+			L2_cache->block_arr[index_L2].block[way][i_L2] = mem[address + i];
+		}
+	}else{
+		L2_cache->block_arr[index_L2].block[way][(offset_L2+3)%config->l2_block_size] = address & 0xff000000;
+		L2_cache->block_arr[index_L2].block[way][(offset_L2+2)%config->l2_block_size] = address & 0x00ff0000;
+		L2_cache->block_arr[index_L2].block[way][(offset_L2+1)%config->l2_block_size] = address & 0x0000ff00;
+		L2_cache->block_arr[index_L2].block[way][(offset_L2)%config->l2_block_size] = address & 0x000000ff;
+	}
+		
+}
 
 //Returns the word that is stored in 'mem[address]'.
-int load_word(int address, byte* mem ){
-	return  mem[address] <<24 | mem[address+1]<<16 | mem[address+2]<<8 | mem[address+3];
+int load_word(unsigned address, byte* mem, L1_CACHE* L1_cache, L2_CACHE* L2_cache,CONFIG* config,int* current_time){
+	unsigned offset_L1;
+	unsigned index_L1;
+	unsigned tag_L1;
+	unsigned offset_L2;
+	unsigned index_L2;
+	unsigned tag_L2;
+	int way;
+	int mem_to_L2_end_time_last_trans;
+	byte* block;
+
+	parse_address(&offset_L1,&index_L1,&tag_L1,address,config->l1_block_size,config->l1_cache_size);
+	parse_address(&offset_L2,&index_L2,&tag_L2,address,config->l2_block_size,config->l2_cache_size);
+
+		if (is_in_L1(index_L1, tag_L1,offset_L1,L1_cache, current_time, config)){
+			block = L1_cache->block_arr[index_L1].block;
+			return block[offset_L1]<<24 | block[offset_L1+1]<<16 | block[offset_L1+2]<<8 | block[offset_L1+3];
+		}else if (is_in_L2(index_L2, tag_L2,offset_L2,L2_cache,current_time,config)){
+			way = !L2_cache->block_arr[index_L2].LRU;
+			block = L2_cache->block_arr[index_L1].block[way];
+			L2_to_L1_trans(L1_cache, offset_L1,index_L1,tag_L1,L2_cache,offset_L2,index_L2,tag_L2,*current_time,config,way);
+			return block[offset_L2]<<24 | block[offset_L2+1]<<16 | block[offset_L2+2]<<8 | block[offset_L2+3];
+		}else{
+			way = !L2_cache->block_arr[index_L2].LRU;
+			MEM_to_L2_trans(mem, L2_cache, offset_L2, index_L2, tag_L2,*current_time,config,address,way,false);
+			way = !L2_cache->block_arr[index_L2].LRU;
+			mem_to_L2_end_time_last_trans = L2_cache->block_arr[index_L2].block_trans_end_time[way];
+			L2_to_L1_trans(L1_cache, offset_L1,index_L1,tag_L1,L2_cache,offset_L2,index_L2,tag_L2,mem_to_L2_end_time_last_trans,config,way);
+			return  mem[address] <<24 | mem[address+1]<<16 | mem[address+2]<<8 | mem[address+3];
+		}
+	
 }
+/*
+//Stores 'val' in 'mem[address]'.
+void store_word (int val , unsigned address,byte* mem,L1_CACHE* L1_cache, L2_CACHE* L2_cache,CONFIG* config,int* current_time){
+
+	unsigned offset_L1;
+	unsigned index_L1;
+	unsigned tag_L1;
+	unsigned offset_L2;
+	unsigned index_L2;
+	unsigned tag_L2;
+	byte* block;
+
+	parse_address(&offset_L1,&index_L1,&tag_L1,address,config->l1_block_size,config->l1_cache_size);
+	parse_address(&offset_L2,&index_L2,&tag_L2,address,config->l2_block_size,config->l2_cache_size);
+
+	if (is_in_L1(index_L1, tag_L1,offset_L1,L1_cache, current_time, config)){
+		L1_cache->block_arr[index_L1].block[(offset_L1+3)%config->l1_block_size] = val & 0xff000000;
+		L1_cache->block_arr[index_L1].block[(offset_L1+2)%config->l1_block_size] = val & 0x00ff0000;
+		L1_cache->block_arr[index_L1].block[(offset_L1+1)%config->l1_block_size] = val & 0x0000ff00;
+		L1_cache->block_arr[index_L1].block[(offset_L1)%config->l1_block_size] = val & 0x000000ff;
+	}else{
+	}
+
+}*/
 
 //Stores 'val' in 'mem[address]'.
 void store_word (int val , int address,byte* mem){
@@ -375,16 +648,44 @@ void execute_instruction(COMMAND cmd, COMMAND* commands_arr, int* registers_arr,
 		registers_arr[0] = 0;
 	}
 }
+
+
 //Executes all commmands stored in 'command_arr'.
-int execute_set_of_instructions(COMMAND* commands_arr, int* registers_arr, byte* mem){
+void execute_set_of_instructions(COMMAND* commands_arr, int* registers_arr, byte* mem, int* current_time, CONFIG* config, L1_CACHE* L1_cache, L2_CACHE* L2_cache ){
 	int instruction_counter = 1;
 	int pc = 0;
+	unsigned tag_L1;
+	unsigned index_L1;
+	unsigned offset_L1;
+	unsigned tag_L2;
+	unsigned index_L2;
+	unsigned offset_L2;
+	int way;
+	int mem_to_L2_end_time_last_trans;
+	
 	while (strcmp(commands_arr[pc].cmd_type, "H") != 0){
+		parse_address(&offset_L1, &index_L1, &tag_L1, commands_arr[pc].inst_address, config->l1_block_size, config->l1_cache_size);
+		parse_address(&offset_L2, &index_L2, &tag_L2, commands_arr[pc].inst_address, config->l2_block_size, config->l2_cache_size);
+		
+		if (!is_in_L1(index_L1, tag_L1,offset_L1,L1_cache, current_time, config)){
+			if (is_in_L2(index_L2, tag_L2,offset_L2,L2_cache,current_time,config)){
+				L2_to_L1_trans(L1_cache, offset_L1,index_L1,tag_L1,L2_cache,offset_L2,index_L2,tag_L2,*current_time,config,way,true);
+			}else{
+				MEM_to_L2_trans(mem, L2_cache, offset_L2, index_L2, tag_L2,*current_time,config,NULL,way,true);
+				way = !L2_cache->block_arr[index_L2].LRU;
+				mem_to_L2_end_time_last_trans = L2_cache->block_arr[index_L2].block_trans_end_time[way];
+				L2_to_L1_trans(L1_cache, offset_L1,index_L1,tag_L1,L2_cache,offset_L2,index_L2,tag_L2,mem_to_L2_end_time_last_trans,config,way,true);
+			}
+		}
+
 		execute_instruction(commands_arr[pc], commands_arr, registers_arr, mem, &pc);
 		instruction_counter++;
 	}
-	return instruction_counter;
+
 }
+
+
+
 
 void update_mem_file(FILE* mem_dump_file, byte* mem){
 	char line[256];
@@ -530,9 +831,55 @@ int load_configuration_file (FILE* config_file,CONFIG* config_struct ){
 }
 
 
+
+
 int main(int argc, char* argv[])
 {
-	assert(argc ==8);
+	int cache_size_L1 = 128;
+	int block_size_L1 = 16;
+	int num_of_blocks_L1 = cache_size_L1/block_size_L1;
+	L1_BLOCK block;
+
+	int cache_size_L2 = 128;
+	int block_size_L2=16;
+	int num_of_blocks_L2 = cache_size_L2/block_size_L2;
+
+	block.block_trans_start_time = 12;
+	block.block_trans_end_time = 16;
+	block.critical_word_offset = 8;
+	block.tag = 5;
+	block.valid = 1;
+	
+	L1_CACHE INST_CACHE_L1;
+	INST_CACHE_L1.block_arr = (L1_BLOCK*)malloc(128*sizeof(L1_BLOCK));
+	INST_CACHE_L1.block_arr[0] = block;
+
+	L2_CACHE INST_CACHE_L2;
+	INST_CACHE_L2.block_arr= (L2_BLOCK*)malloc(1024*sizeof(L1_BLOCK));
+	
+	L2_BLOCK block2;
+	block2.block_trans_start_time[1]=10;
+	block2.block_trans_end_time[1]= 18;
+	block2.critical_word_offset[1] = 12;
+	block2.LRU = 0;
+	block2.tag[1]=5;
+	block2.valid[1]=1;
+	block2.valid[0]=0;
+	
+	INST_CACHE_L2.block_arr[0]=block2;
+
+	int current_time = 11;
+	CONFIG config;
+
+	FILE* config_file = fopen("C:\\Users\\dell\\Desktop\\config_file.txt","rb");
+	if (config_file == NULL){
+		printf("Error openning file %s\n", config_file);
+		return -1;
+	}
+	load_configuration_file (config_file,&config);
+	is_in_L2(0, 5, 4, &INST_CACHE_L2, &current_time, &config);
+
+	/*assert(argc ==8);
 	char* cmd = argv[1];//input file name 
 	char* config = argv[2];//input file name 
 	char* mem_init = argv[3];//input file name 
@@ -555,7 +902,6 @@ int main(int argc, char* argv[])
 	int line_counter = 0;
 	int counter = 0;
 	CONFIG config_struct;
-
 
 	cmd_file = fopen(cmd,"r"); 
 	if (cmd_file == NULL){
@@ -616,6 +962,8 @@ int main(int argc, char* argv[])
 	fclose(mem_dump_file);
 	fclose(time_file);
 	fclose(committed_file);
-
+	*/
+	int x;
+	scanf("%d", &x);
 	return 0 ;
 }
